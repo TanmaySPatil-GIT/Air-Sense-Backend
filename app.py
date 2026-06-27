@@ -112,7 +112,13 @@ def live():
     conditions = parse_conditions(condition_raw)
 
     if not lat or not lon:
-        return jsonify({"error": "lat and lon are required"}), 400
+        return jsonify({"error": "Missing required parameters: lat and lon"}), 400
+
+    try:
+        float(lat)
+        float(lon)
+    except ValueError:
+        return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
 
     params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
     resp = requests.get(OWM_AIR_POLLUTION_URL, params=params)
@@ -153,7 +159,13 @@ def forecast():
     lon = request.args.get("lon")
 
     if not lat or not lon:
-        return jsonify({"error": "lat and lon are required"}), 400
+        return jsonify({"error": "Missing required parameters: lat and lon"}), 400
+
+    try:
+        float(lat)
+        float(lon)
+    except ValueError:
+        return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
 
     params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
     resp = requests.get(OWM_FORECAST_URL, params=params)

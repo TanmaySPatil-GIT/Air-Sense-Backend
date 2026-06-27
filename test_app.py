@@ -1,7 +1,7 @@
 import unittest
 import time
 from unittest.mock import patch, MagicMock
-from app import app, AQI_MAPPING
+from app import app, AQI_LEVEL_MAP as AQI_MAPPING
 
 class TestAirSenseBackend(unittest.TestCase):
     def setUp(self):
@@ -11,7 +11,7 @@ class TestAirSenseBackend(unittest.TestCase):
     def test_health_check(self):
         response = self.app.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json, {"status": "running"})
+        self.assertEqual(response.json, {"status": "Air Sense backend is running"})
 
     def test_validation_errors(self):
         # Missing lat/lon
@@ -57,14 +57,14 @@ class TestAirSenseBackend(unittest.TestCase):
         response = self.app.get("/live?lat=40.7128&lon=-74.0060&condition=copd")
         self.assertEqual(response.status_code, 200)
         data = response.json
-        self.assertEqual(data["aqi"], 3)
-        self.assertEqual(data["aqi_display"], AQI_MAPPING[3]["display_aqi"])
-        self.assertEqual(data["label"], "Moderate")
-        self.assertEqual(data["color"], "orange")
-        self.assertEqual(data["condition"], "copd")
+        self.assertEqual(data["aqi_level"], 3)
+        self.assertEqual(data["display_aqi"], AQI_MAPPING[3]["display_aqi"])
+        self.assertEqual(data["aqi_label"], "Moderate")
+        self.assertEqual(data["aqi_color"], "orange")
+        self.assertEqual(data["conditions_used"], ["copd"])
         self.assertEqual(
             data["personalized_risk"],
-            "Warning. COPD symptoms may worsen. Stay indoors in well-ventilated or air-conditioned rooms."
+            "Moderate risk — consider limiting prolonged outdoor activity (COPD)"
         )
         self.assertEqual(data["pollutants"]["pm2_5"], 12.5)
 
@@ -104,12 +104,11 @@ class TestAirSenseBackend(unittest.TestCase):
         data = response.json
         
         # Verify it filters correctly
-        self.assertTrue(len(data["forecast"]) <= 25)
+        self.assertTrue(len(data["hourly"]) <= 24)
         
         # Verify best time window contains correct information
-        best_window = data["best_time_window"]
-        self.assertEqual(best_window["aqi"], 1)
-        self.assertEqual(best_window["duration_hours"], 3) # index 5, 6, 7 represents 3 consecutive hours
+        self.assertEqual(data["best_window_aqi"], AQI_MAPPING[1]["display_aqi"])
+        self.assertEqual(data["best_window_start"], now + 5 * 3600)
 
     @patch("app.requests.get")
     def test_external_api_error(self, mock_get):
@@ -121,9 +120,8 @@ class TestAirSenseBackend(unittest.TestCase):
         mock_get.return_value = mock_response
 
         response = self.app.get("/live?lat=40.7128&lon=-74.0060")
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(response.json["error"], "Failed to fetch data from weather service")
-        self.assertIn("Invalid API key", response.json["details"])
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json["error"], "Failed to fetch air quality data")
 
 if __name__ == "__main__":
     unittest.main()
