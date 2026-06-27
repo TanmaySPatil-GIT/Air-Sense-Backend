@@ -14,7 +14,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _DEFAULT_GEMINI_KEY)
 _gemini_client = None
 _gemini_available = False
 try:
-    from google import genai
+    from google import genai  # pyrefly: ignore[missing-import]
     if GEMINI_API_KEY and GEMINI_API_KEY != _DEFAULT_GEMINI_KEY:
         _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
         _gemini_available = True
