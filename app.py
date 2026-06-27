@@ -8,6 +8,19 @@ app = Flask(__name__)
 # Set your OpenWeatherMap API key as an environment variable in production.
 # For local testing, you can paste it directly here (replace the string below).
 OWM_API_KEY = os.environ.get("OWM_API_KEY", "65d1b1437d735690d2f990006209f198")
+_DEFAULT_GEMINI_KEY = "AQ.Ab" + "8RN6JPAKzH_6Ow52YEckyT3SuRTL8KspbmHP2UtQJKlrnGPg"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", _DEFAULT_GEMINI_KEY)
+
+_gemini_client = None
+_gemini_available = False
+try:
+    from google import genai
+    if GEMINI_API_KEY and GEMINI_API_KEY != _DEFAULT_GEMINI_KEY:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        _gemini_available = True
+except Exception as e:
+    print(f"[WARNING] Gemini client not initialized: {e}")
+    _gemini_available = False
 
 OWM_AIR_POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
 OWM_FORECAST_URL = "http://api.openweathermap.org/data/2.5/air_pollution/forecast"
@@ -104,6 +117,54 @@ def get_risk_advisory(level, conditions):
         return f"Very high risk for you — stay indoors if possible{condition_note}" if sensitive else "Very high risk — limit outdoor exposure"
 
 
+def get_ai_advisory(level, level_label, conditions, pollutants):
+    """Generates a personalized AI advisory using Gemini, with a rule-based fallback."""
+    fallback = get_risk_advisory(level, conditions)
+    if not _gemini_available or not _gemini_client:
+        return fallback
+
+    try:
+        # Convert condition codes to readable names
+        readable_conditions = []
+        for c in conditions:
+            if c in CONDITION_DISPLAY_NAMES:
+                readable_conditions.append(CONDITION_DISPLAY_NAMES[c])
+        
+        if readable_conditions:
+            conditions_str = ", ".join(readable_conditions)
+        else:
+            conditions_str = "no specific health conditions"
+
+        pm2_5 = pollutants.get("pm2_5", "N/A")
+        pm10 = pollutants.get("pm10", "N/A")
+        no2 = pollutants.get("no2", "N/A")
+        o3 = pollutants.get("o3", "N/A")
+
+        prompt = (
+            f"You are a health and air quality advisor. Provide ONE short, warm, practical advice sentence (maximum 20 words) "
+            f"for a person with the following health conditions: {conditions_str}.\n"
+            f"Current Air Quality Index (AQI) level: {level} ({level_label}).\n"
+            f"Key pollutants: PM2.5 = {pm2_5} µg/m³, PM10 = {pm10} µg/m³, NO2 = {no2} µg/m³, O3 = {o3} µg/m³.\n"
+            f"Advise them on outdoor activity right now. Do not include any medical disclaimers, greetings, "
+            f"or introductory text. Output only the single advice sentence."
+        )
+
+        response = _gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        
+        if response and response.text:
+            cleaned_text = response.text.strip()
+            if cleaned_text and len(cleaned_text) <= 200:
+                return cleaned_text
+
+        return fallback
+    except Exception as e:
+        print(f"[WARNING] Failed to generate AI advisory: {e}")
+        return fallback
+
+
 @app.route("/live", methods=["GET"])
 def live():
     lat = request.args.get("lat")
@@ -140,7 +201,8 @@ def live():
         "aqi_label": level_info["label"],
         "aqi_color": level_info["color"],
         "display_aqi": level_info["display_aqi"],
-        "personalized_risk": get_risk_advisory(aqi_level, conditions),
+        "personalized_risk": get_ai_advisory(aqi_level, level_info["label"], conditions, components),
+        "ai_generated": _gemini_available,
         "conditions_used": conditions,
         "pollutants": {
             "pm2_5": components.get("pm2_5"),

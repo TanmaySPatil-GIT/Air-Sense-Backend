@@ -7,6 +7,9 @@ class TestAirSenseBackend(unittest.TestCase):
     def setUp(self):
         self.app = app.test_client()
         self.app.testing = True
+        # Ensure Gemini is disabled in tests to test rule-based fallback
+        import app as app_module
+        app_module._gemini_available = False
 
     def test_health_check(self):
         response = self.app.get("/")
@@ -62,6 +65,7 @@ class TestAirSenseBackend(unittest.TestCase):
         self.assertEqual(data["aqi_label"], "Moderate")
         self.assertEqual(data["aqi_color"], "orange")
         self.assertEqual(data["conditions_used"], ["copd"])
+        self.assertEqual(data["ai_generated"], False)
         self.assertEqual(
             data["personalized_risk"],
             "Moderate risk — consider limiting prolonged outdoor activity (COPD)"
