@@ -1,283 +1,198 @@
-import os
-import time
-import logging
+# pyrefly: ignore [missing-import]
 from flask import Flask, request, jsonify
 import requests
-from dotenv import load_dotenv
-
-# Initialize logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# Load env variables
-load_dotenv()
-OWM_API_KEY = os.getenv("OWM_API_KEY")
+import os
 
 app = Flask(__name__)
 
-# Add CORS headers for developer convenience
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
-    response.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
-    return response
+# Set your OpenWeatherMap API key as an environment variable in production.
+# For local testing, you can paste it directly here (replace the string below).
+OWM_API_KEY = os.environ.get("OWM_API_KEY", "65d1b1437d735690d2f990006209f198")
 
-# AQI Mapping config
-AQI_MAPPING = {
-    1: {"label": "Good", "color": "green", "display_aqi": 40},
+OWM_AIR_POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
+OWM_FORECAST_URL = "http://api.openweathermap.org/data/2.5/air_pollution/forecast"
+
+# OpenWeatherMap AQI index is 1-5, not the standard 0-500 scale.
+# We map it to a simplified category + a rough 0-500-style number for display.
+AQI_LEVEL_MAP = {
+    1: {"label": "Good", "color": "green", "display_aqi": 30},
     2: {"label": "Fair", "color": "yellow", "display_aqi": 75},
-    3: {"label": "Moderate", "color": "orange", "display_aqi": 130},
-    4: {"label": "Poor", "color": "red", "display_aqi": 185},
-    5: {"label": "Very Poor", "color": "maroon", "display_aqi": 350}
+    3: {"label": "Moderate", "color": "orange", "display_aqi": 125},
+    4: {"label": "Poor", "color": "red", "display_aqi": 200},
+    5: {"label": "Very Poor", "color": "maroon", "display_aqi": 300},
 }
 
-# Personalized risk guidance
-RISK_MAPPINGS = {
-    "none": {
-        1: "Air quality is satisfactory, and air pollution poses little or no risk.",
-        2: "Air quality is acceptable; however, some pollutants may cause moderate health concerns for a very small number of people.",
-        3: "Members of sensitive groups may experience health effects. The general public is less likely to be affected.",
-        4: "Everyone may begin to experience health effects; members of sensitive groups may experience more serious health effects.",
-        5: "Health alert: everyone may experience more serious health effects."
-    },
-    "asthma": {
-        1: "Air is clean. Very low risk of asthma trigger.",
-        2: "Minor risk. Asthmatics should monitor symptoms like coughing or wheezing.",
-        3: "Moderate risk. Keep your quick-relief inhaler handy; consider reducing outdoor activities.",
-        4: "High risk. Avoid outdoor activity, keep inhaler close, and stay indoors in clean air.",
-        5: "Extreme risk. Severe asthma trigger potential. Stay indoors, run air purifiers, and follow your asthma action plan."
-    },
-    "allergies": {
-        1: "Low allergen impact. Safe for outdoor activities.",
-        2: "Mild allergen concern. Sensitive allergy sufferers might feel mild irritation.",
-        3: "Moderate allergen impact. Take allergy medications if needed; limit prolonged outdoor exposure.",
-        4: "High allergen impact. Stay indoors with windows closed and use air conditioning.",
-        5: "Severe allergy threat. High risk of sinus irritation, itching, or respiratory distress. Stay indoors."
-    },
-    "copd": {
-        1: "Safe conditions for COPD patients. Easy breathing.",
-        2: "Generally safe, but monitor breathing. Limit heavy exertion.",
-        3: "Warning. COPD symptoms may worsen. Stay indoors in well-ventilated or air-conditioned rooms.",
-        4: "Dangerous. High risk of breathing difficulties. Avoid all outdoor physical activity.",
-        5: "Critical threat. Severe COPD exacerbation risk. Call doctor if symptoms worsen. Stay inside with clean air filtration."
-    }
+
+
+
+VALID_CONDITIONS = {
+    "asthma", "copd", "allergies", "bronchitis", "sinusitis",
+    "heart_disease", "lung_cancer", "pneumonia", "pregnancy",
+    "other", "none",
 }
 
-def get_personalized_risk(condition, aqi):
-    # Normalize condition key
-    cond_key = str(condition).lower().strip() if condition else "none"
-    if cond_key not in RISK_MAPPINGS:
-        cond_key = "none"
-    
-    # aqi should be bounded between 1 and 5
-    aqi_val = max(1, min(5, int(aqi)))
-    return RISK_MAPPINGS[cond_key][aqi_val]
+# How much each condition raises sensitivity at the same AQI level.
+# 2 = high sensitivity, 1 = moderate sensitivity, 0 = baseline/no extra risk.
+CONDITION_WEIGHT = {
+    "asthma": 2,
+    "copd": 2,
+    "heart_disease": 2,
+    "pregnancy": 2,
+    "bronchitis": 1,
+    "pneumonia": 1,
+    "lung_cancer": 1,
+    "allergies": 1,
+    "sinusitis": 1,
+    "other": 1,
+    "none": 0,
+}
 
-def find_best_time_window(hourly_items):
-    if not hourly_items:
-        return None
-    
-    min_aqi = min(item["main"]["aqi"] for item in hourly_items)
-    
-    # Find the longest consecutive run of min_aqi
-    best_run = []
-    current_run = []
-    
-    for item in hourly_items:
-        if item["main"]["aqi"] == min_aqi:
-            current_run.append(item)
-        else:
-            if len(current_run) > len(best_run):
-                best_run = current_run
-            current_run = []
-            
-    if len(current_run) > len(best_run):
-        best_run = current_run
-        
-    if not best_run:
-        return None
-        
-    start_dt = best_run[0]["dt"]
-    end_dt = best_run[-1]["dt"] + 3600  # End of the last hour block
-    
-    return {
-        "aqi": min_aqi,
-        "label": AQI_MAPPING[min_aqi]["label"],
-        "color": AQI_MAPPING[min_aqi]["color"],
-        "display_aqi": AQI_MAPPING[min_aqi]["display_aqi"],
-        "start_time": start_dt,
-        "end_time": end_dt,
-        "start_time_formatted": time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(start_dt)) + " UTC",
-        "end_time_formatted": time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(end_dt)) + " UTC",
-        "duration_hours": len(best_run)
-    }
+CONDITION_DISPLAY_NAMES = {
+    "asthma": "asthma",
+    "copd": "COPD",
+    "allergies": "allergies",
+    "bronchitis": "bronchitis",
+    "sinusitis": "sinusitis",
+    "heart_disease": "heart condition",
+    "lung_cancer": "lung condition",
+    "pneumonia": "pneumonia history",
+    "pregnancy": "pregnancy",
+    "other": "your condition",
+}
 
-# Check for API Key configuration
-if not OWM_API_KEY or OWM_API_KEY == "65d1b1437d735690d2f990006209f198":
-    logger.warning("OWM_API_KEY environment variable is not configured or using default placeholder. API requests may fail.")
+
+def parse_conditions(raw):
+    """Parses a comma-separated condition string into a clean, valid list."""
+    if not raw:
+        return ["none"]
+    parts = [c.strip().lower() for c in raw.split(",") if c.strip()]
+    parts = [c for c in parts if c in VALID_CONDITIONS]
+    if not parts:
+        return ["none"]
+    # "none" should never be combined with real conditions.
+    if "none" in parts and len(parts) > 1:
+        parts = [c for c in parts if c != "none"]
+    return parts
+
+
+def get_risk_advisory(level, conditions):
+    """Returns a personalized advisory line based on AQI level and a list of conditions."""
+    conditions = conditions or ["none"]
+
+    # Sensitivity = highest weight among all selected conditions.
+    max_weight = max(CONDITION_WEIGHT.get(c, 0) for c in conditions)
+    sensitive = max_weight >= 2
+    mildly_sensitive = max_weight == 1
+
+    # Build a short reference to the most relevant condition(s) for phrasing.
+    named = [CONDITION_DISPLAY_NAMES[c] for c in conditions if c in CONDITION_DISPLAY_NAMES]
+    condition_note = f" ({', '.join(named)})" if named and sensitive else ""
+
+    if level <= 1:
+        return "Low risk for you" if not sensitive else f"Low risk, air is clean today{condition_note}"
+    elif level == 2:
+        if sensitive:
+            return f"Mild risk — take normal precautions{condition_note}"
+        elif mildly_sensitive:
+            return "Mild risk for you"
+        return "Low risk for you"
+    elif level == 3:
+        return f"Moderate risk — consider limiting prolonged outdoor activity{condition_note}" if sensitive else "Moderate risk for you"
+    elif level == 4:
+        return f"High risk for you — avoid outdoor activity if possible{condition_note}" if sensitive else "High risk for prolonged outdoor activity"
+    else:
+        return f"Very high risk for you — stay indoors if possible{condition_note}" if sensitive else "Very high risk — limit outdoor exposure"
+
+
+@app.route("/live", methods=["GET"])
+def live():
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    condition_raw = request.args.get("condition", "none")  # e.g. "asthma,pregnancy"
+    conditions = parse_conditions(condition_raw)
+
+    if not lat or not lon:
+        return jsonify({"error": "lat and lon are required"}), 400
+
+    params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
+    resp = requests.get(OWM_AIR_POLLUTION_URL, params=params)
+
+    if resp.status_code != 200:
+        return jsonify({"error": "Failed to fetch air quality data"}), 502
+
+    data = resp.json()
+    try:
+        aqi_level = data["list"][0]["main"]["aqi"]
+        components = data["list"][0]["components"]
+    except (KeyError, IndexError):
+        return jsonify({"error": "Unexpected response from data provider"}), 502
+
+    level_info = AQI_LEVEL_MAP.get(aqi_level, AQI_LEVEL_MAP[3])
+
+    return jsonify({
+        "aqi_level": aqi_level,
+        "aqi_label": level_info["label"],
+        "aqi_color": level_info["color"],
+        "display_aqi": level_info["display_aqi"],
+        "personalized_risk": get_risk_advisory(aqi_level, conditions),
+        "conditions_used": conditions,
+        "pollutants": {
+            "pm2_5": components.get("pm2_5"),
+            "pm10": components.get("pm10"),
+            "no2": components.get("no2"),
+            "o3": components.get("o3"),
+            "so2": components.get("so2"),
+            "co": components.get("co"),
+        }
+    })
+
+
+@app.route("/forecast", methods=["GET"])
+def forecast():
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+
+    if not lat or not lon:
+        return jsonify({"error": "lat and lon are required"}), 400
+
+    params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
+    resp = requests.get(OWM_FORECAST_URL, params=params)
+
+    if resp.status_code != 200:
+        return jsonify({"error": "Failed to fetch forecast data"}), 502
+
+    data = resp.json()
+    entries = data.get("list", [])[:24]  # next 24 hours
+
+    hourly = []
+    for entry in entries:
+        aqi_level = entry["main"]["aqi"]
+        level_info = AQI_LEVEL_MAP.get(aqi_level, AQI_LEVEL_MAP[3])
+        hourly.append({
+            "timestamp": entry["dt"],
+            "aqi_level": aqi_level,
+            "display_aqi": level_info["display_aqi"],
+            "color": level_info["color"],
+        })
+
+    if not hourly:
+        return jsonify({"error": "No forecast data available"}), 502
+
+    # Find the best (lowest AQI) window of at least 2 consecutive hours.
+    best_start_idx = min(range(len(hourly)), key=lambda i: hourly[i]["display_aqi"])
+    best_window_start = hourly[best_start_idx]["timestamp"]
+
+    return jsonify({
+        "hourly": hourly,
+        "best_window_start": best_window_start,
+        "best_window_aqi": hourly[best_start_idx]["display_aqi"],
+    })
+
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "running"}), 200
+    return jsonify({"status": "Air Sense backend is running"})
 
-@app.route("/live", methods=["GET"])
-def get_live_air_quality():
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-    condition = request.args.get("condition", "none")
-    
-    if not lat or not lon:
-        return jsonify({"error": "Missing required parameters: lat and lon"}), 400
-        
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except ValueError:
-        return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
-
-    if not OWM_API_KEY:
-        return jsonify({"error": "API configuration error: OWM_API_KEY is not set"}), 500
-        
-    url = "http://api.openweathermap.org/data/2.5/air_pollution"
-    params = {
-        "lat": lat_f,
-        "lon": lon_f,
-        "appid": OWM_API_KEY
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code != 200:
-            logger.error(f"OpenWeatherMap API returned status {response.status_code}: {response.text}")
-            return jsonify({
-                "error": "Failed to fetch data from weather service",
-                "remote_status": response.status_code,
-                "details": response.json().get("message", response.text)
-            }), response.status_code
-            
-        data = response.json()
-        
-        # Verify the structure of the returned response
-        if not data.get("list") or len(data["list"]) == 0:
-            return jsonify({"error": "No air quality data returned by service"}), 502
-            
-        latest = data["list"][0]
-        aqi = latest["main"]["aqi"]
-        components = latest["components"]
-        
-        mapped = AQI_MAPPING.get(aqi, {"label": "Unknown", "color": "grey", "display_aqi": 0})
-        risk = get_personalized_risk(condition, aqi)
-        
-        result = {
-            "coord": data.get("coord", {"lat": lat_f, "lon": lon_f}),
-            "aqi": aqi,
-            "aqi_display": mapped["display_aqi"],
-            "label": mapped["label"],
-            "color": mapped["color"],
-            "condition": condition,
-            "personalized_risk": risk,
-            "pollutants": {
-                "pm2_5": components.get("pm2_5"),
-                "pm10": components.get("pm10"),
-                "no2": components.get("no2"),
-                "o3": components.get("o3"),
-                "so2": components.get("so2"),
-                "co": components.get("co")
-            }
-        }
-        return jsonify(result), 200
-        
-    except requests.RequestException as e:
-        logger.exception("Error calling OpenWeatherMap API")
-        return jsonify({"error": "Failed to connect to weather service", "details": str(e)}), 502
-
-@app.route("/forecast", methods=["GET"])
-def get_air_quality_forecast():
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-    
-    if not lat or not lon:
-        return jsonify({"error": "Missing required parameters: lat and lon"}), 400
-        
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-    except ValueError:
-        return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
-
-    if not OWM_API_KEY:
-        return jsonify({"error": "API configuration error: OWM_API_KEY is not set"}), 500
-        
-    url = "http://api.openweathermap.org/data/2.5/air_pollution/forecast"
-    params = {
-        "lat": lat_f,
-        "lon": lon_f,
-        "appid": OWM_API_KEY
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code != 200:
-            logger.error(f"OpenWeatherMap API returned status {response.status_code}: {response.text}")
-            return jsonify({
-                "error": "Failed to fetch forecast from weather service",
-                "remote_status": response.status_code,
-                "details": response.json().get("message", response.text)
-            }), response.status_code
-            
-        data = response.json()
-        forecast_list = data.get("list", [])
-        
-        # Filter for the next 24 hours
-        now = int(time.time())
-        twenty_four_hours_sec = 24 * 60 * 60
-        
-        hourly_data = [
-            item for item in forecast_list
-            if now <= item.get("dt", 0) <= now + twenty_four_hours_sec
-        ]
-        
-        # Fallback if filtered list is empty (e.g. clock mismatch)
-        if not hourly_data:
-            hourly_data = forecast_list[:24]
-            
-        formatted_forecast = []
-        for item in hourly_data:
-            dt = item["dt"]
-            aqi = item["main"]["aqi"]
-            components = item.get("components", {})
-            mapped = AQI_MAPPING.get(aqi, {"label": "Unknown", "color": "grey", "display_aqi": 0})
-            
-            formatted_forecast.append({
-                "dt": dt,
-                "time_formatted": time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(dt)) + " UTC",
-                "aqi": aqi,
-                "aqi_display": mapped["display_aqi"],
-                "label": mapped["label"],
-                "color": mapped["color"],
-                "pollutants": {
-                    "pm2_5": components.get("pm2_5"),
-                    "pm10": components.get("pm10"),
-                    "no2": components.get("no2"),
-                    "o3": components.get("o3"),
-                    "so2": components.get("so2"),
-                    "co": components.get("co")
-                }
-            })
-            
-        best_window = find_best_time_window(hourly_data)
-        
-        result = {
-            "coord": data.get("coord", {"lat": lat_f, "lon": lon_f}),
-            "forecast": formatted_forecast,
-            "best_time_window": best_window
-        }
-        return jsonify(result), 200
-        
-    except requests.RequestException as e:
-        logger.exception("Error calling OpenWeatherMap API")
-        return jsonify({"error": "Failed to connect to weather service", "details": str(e)}), 502
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)
