@@ -1,9 +1,47 @@
 # pyrefly: ignore [missing-import]
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import requests
 import os
+import time
 
 app = Flask(__name__)
+
+# Configure Flask-Limiter for rate limiting (global limit of 30 req/min per IP)
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["30 per minute"],
+    storage_uri="memory://"
+)
+
+# Custom error handler for Rate Limit Exceeded
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "Rate limit exceeded",
+        "message": str(e.description)
+    }), 429
+
+# Simple in-memory response cache
+APP_CACHE = {}
+
+def get_cached_response(key):
+    entry = APP_CACHE.get(key)
+    if entry:
+        if time.time() < entry["expires_at"]:
+            return entry["data"]
+        else:
+            # Clean up expired entry
+            APP_CACHE.pop(key, None)
+    return None
+
+def set_cached_response(key, data, ttl_seconds):
+    APP_CACHE[key] = {
+        "data": data,
+        "expires_at": time.time() + ttl_seconds
+    }
 
 # Set your OpenWeatherMap API key as an environment variable in production.
 # For local testing, you can paste it directly here (replace the string below).
@@ -176,10 +214,20 @@ def live():
         return jsonify({"error": "Missing required parameters: lat and lon"}), 400
 
     try:
-        float(lat)
-        float(lon)
+        lat_f = float(lat)
+        lon_f = float(lon)
     except ValueError:
         return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
+
+    # Build cache key with rounded coordinates and sorted conditions
+    lat_rounded = round(lat_f, 2)
+    lon_rounded = round(lon_f, 2)
+    cache_key = ("live", lat_rounded, lon_rounded, tuple(sorted(conditions)))
+    
+    # Check cache
+    cached_val = get_cached_response(cache_key)
+    if cached_val is not None:
+        return jsonify(cached_val)
 
     params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
     resp = requests.get(OWM_AIR_POLLUTION_URL, params=params)
@@ -196,7 +244,7 @@ def live():
 
     level_info = AQI_LEVEL_MAP.get(aqi_level, AQI_LEVEL_MAP[3])
 
-    return jsonify({
+    response_data = {
         "aqi_level": aqi_level,
         "aqi_label": level_info["label"],
         "aqi_color": level_info["color"],
@@ -212,7 +260,12 @@ def live():
             "so2": components.get("so2"),
             "co": components.get("co"),
         }
-    })
+    }
+    
+    # Save to cache with 10 minutes TTL (600 seconds)
+    set_cached_response(cache_key, response_data, 600)
+
+    return jsonify(response_data)
 
 
 @app.route("/forecast", methods=["GET"])
@@ -224,10 +277,20 @@ def forecast():
         return jsonify({"error": "Missing required parameters: lat and lon"}), 400
 
     try:
-        float(lat)
-        float(lon)
+        lat_f = float(lat)
+        lon_f = float(lon)
     except ValueError:
         return jsonify({"error": "Invalid parameters: lat and lon must be numbers"}), 400
+
+    # Build cache key with rounded coordinates
+    lat_rounded = round(lat_f, 2)
+    lon_rounded = round(lon_f, 2)
+    cache_key = ("forecast", lat_rounded, lon_rounded)
+
+    # Check cache
+    cached_val = get_cached_response(cache_key)
+    if cached_val is not None:
+        return jsonify(cached_val)
 
     params = {"lat": lat, "lon": lon, "appid": OWM_API_KEY}
     resp = requests.get(OWM_FORECAST_URL, params=params)
@@ -256,11 +319,16 @@ def forecast():
     best_start_idx = min(range(len(hourly)), key=lambda i: hourly[i]["display_aqi"])
     best_window_start = hourly[best_start_idx]["timestamp"]
 
-    return jsonify({
+    response_data = {
         "hourly": hourly,
         "best_window_start": best_window_start,
         "best_window_aqi": hourly[best_start_idx]["display_aqi"],
-    })
+    }
+
+    # Save to cache with 30 minutes TTL (1800 seconds)
+    set_cached_response(cache_key, response_data, 1800)
+
+    return jsonify(response_data)
 
 
 @app.route("/", methods=["GET"])
